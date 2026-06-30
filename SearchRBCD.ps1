@@ -1,9 +1,3 @@
-# ExecutionPolicy Bypass
-powershell -ep bypass
-
-# import the PowerView module
-Import-Module .\PowerView.ps1
-
 # get all computers in the domain
 $computers = Get-DomainComputer
 
